@@ -2,7 +2,7 @@
   "name": "ctags-support",
   "displayName": "CTags Support",
   "description": "CTags support with navigation to definition and navigation history recored",
-  "version": "1.0.8",
+  "version": "1.0.9",
   "publisher": "jaydenlin",
   "icon": "images/icon.png",
   "engines": {
@@ -74,6 +74,7 @@
   "dependencies": {
     "bluebird": "^3.5.0",
     "ctags": "^3.0.0",
-    "event-stream": "^3.3.4"
+    "event-stream": "^3.3.4",
+    "minimatch": "^3.0.3"
   }
 }
