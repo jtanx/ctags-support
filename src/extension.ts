@@ -3,11 +3,10 @@
 // Import the module and reference it with the alias vscode in your code below
 import * as vscode from 'vscode';
 const Promise = require('bluebird');
-const ctags = require('ctags');
+const ctagz = require('ctagz')
 const es = require('event-stream');
 const path = require('path');
 const fs = require('fs');
-const bfs = Promise.promisifyAll(fs);
 const minimatch = require('minimatch');
 const STATE_KEY = "ctagsSupport";
 let navigationHistory = [];
@@ -40,7 +39,7 @@ export function activate(context: vscode.ExtensionContext) {
     let disposableShowNavigationHistory = vscode.commands.registerCommand('extension.showNavigationHistory', () => {
 
         vscode.window.showQuickPick(navigationHistory).then(val=> {
-            navigateToDefinition(val.filePath,val.pattern.slice(1, -1));//Should remove the first '/' and last '/' character
+            navigateToDefinition(val.filePath,val.address);//Should remove the first '/' and last '/' character
         });
 
     });
@@ -70,87 +69,57 @@ export function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(disposableClearOneNavigationHistory);
 }
 
-function findCTagsFile(searchPath, tagFilePattern = '{.,}tags') {
-    const ctagsFinder = function ctagsFinder(tagPath) {
-        console.log(`Searching ${tagPath}`)
-        return bfs.readdirAsync(tagPath).then(files => {
-            const matched = files.filter(minimatch.filter(tagFilePattern)).sort()
-            const ret = !matched ? Promise.resolve(null) :
-            Promise.reduce(matched, (acc, match) => {
-                if (acc) {
-                    return acc
-                }
-                const matchPath = path.join(tagPath, match)
-                return bfs.statAsync(matchPath).then(stats => {
-                    if (stats.isFile()) {
-                        console.log(`Found tags file at ${matchPath}`)
-                        return matchPath
-                    }
-                    return null
-                })
-            }, null)
-
-            return ret.then(result => {
-                const newTagPath = path.dirname(tagPath)
-                if (!result && newTagPath !== tagPath) {
-                    return ctagsFinder(newTagPath)
-                }
-                return result
-            })
-        })
-    }
-
-    let tagPath = path.resolve(searchPath)
-    return bfs.statAsync(tagPath).then(stats => {
-        if (stats.isFile()) {
-            tagPath = path.dirname(tagPath)
-        }
-        return ctagsFinder(tagPath)
-    })
-}
-
 function searchTags(context: vscode.ExtensionContext) {
     const editor = getEditor();
     const query = getSelectedText(editor);
     const filePath = editor.document.fileName;
 
-    findCTagsFile(filePath).then(tagsPath => {
-        if (!tagsPath) {
+    let ctags
+    ctagz.findCTagsFile(filePath).then(tags => {
+        if (!tags) {
             vscode.window.showErrorMessage('No tags file was found')
             return
         }
-
-        ctags.findTags(tagsPath, query, (error, tags=[]) =>{
-            console.log(`Search result`, tags)
-            const displayFiles = tags.map((tag)=>{
-                return {
-                    description: "",
-                    label: path.basename(tag.file)+" - "+tag.pattern.replace(/^\/?\^?(.*?)\$?\/?$/g, '$1'),
-                    detail: tag.file,
-                    filePath: path.join(path.dirname(tagsPath),tag.file),
-                    lineNumber:tag.lineNumber,
-                    pattern:tag.pattern};
-            });
-
-            //Case 1. Only one tag found
-            if(displayFiles.length === 1){
-                recordHistory(displayFiles[0]);
-                saveWorkspaceState(context,STATE_KEY,{navigationHistory:navigationHistory});
-                navigateToDefinition(displayFiles[0].filePath,displayFiles[0].pattern.slice(1, -1));//Should remove the first '/' and last '/' character
-            //Case 2. Many tags found
-            } else if(displayFiles.length > 0){
-                vscode.window.showQuickPick(displayFiles).then(val=> {
-                    recordHistory(val);
-                    saveWorkspaceState(context,STATE_KEY,{navigationHistory:navigationHistory});
-                    navigateToDefinition(val.filePath,val.pattern.slice(1, -1));//Should remove the first '/' and last '/' character
-                });
-             //Case 3. No tags found
-            } else{
-                vscode.window.showInformationMessage('No related tags found for "'+query+'"');
-            }
+        ctags = tags
+        return tags.init()
+    })
+    .then(() => ctags.findBinary(query))
+    .then(tags => {
+        console.log(`Search result`, tags)
+        const displayFiles: any[] = tags.map((tag)=>{
+            return {
+                description: "",
+                label: path.basename(tag.file)+" - "+ (tag.address.pattern || "Line " + tag.address.lineNumber.toString()),
+                detail: tag.file,
+                filePath: path.join(path.dirname(ctags.tagsFile),tag.file),
+                lineNumber:tag.lineNumber,
+                address:tag.address};
         });
-    }).catch(err => {
+
+        //Case 1. Only one tag found
+        if(displayFiles.length === 1){
+            recordHistory(displayFiles[0]);
+            saveWorkspaceState(context,STATE_KEY,{navigationHistory:navigationHistory});
+            navigateToDefinition(displayFiles[0].filePath,displayFiles[0].address);//Should remove the first '/' and last '/' character
+        //Case 2. Many tags found
+        } else if(displayFiles.length > 0){
+            vscode.window.showQuickPick(displayFiles).then(val=> {
+                recordHistory(val);
+                saveWorkspaceState(context,STATE_KEY,{navigationHistory:navigationHistory});
+                navigateToDefinition(val.filePath,val.address);//Should remove the first '/' and last '/' character
+            });
+            //Case 3. No tags found
+        } else{
+            vscode.window.showInformationMessage('No related tags found for "'+query+'"');
+        }
+    })
+    .catch(err => {
         console.log(`An error occurred trying to find the tags file: ${err}`)
+    })
+    .finally(() => {
+        if (ctags) {
+            ctags.destroy()
+        }
     })
 }
 
@@ -178,18 +147,26 @@ function recordHistory(visistedFile:any) {
 
 }
 
-function navigateToDefinition(filePath:string,pattern:string) {
-    vscode.workspace.openTextDocument(filePath).then(d=> {
-        vscode.window.showTextDocument(d).then(textEditor=>{
-            findLineNumber(fs.createReadStream(d.fileName),pattern).then(lineNumber => {
-                console.log("Going to", lineNumber)
-                goToLine(lineNumber);
+function navigateToDefinition(filePath:string,address:any) {
+    if (address.lineNumber) {
+        vscode.workspace.openTextDocument(filePath).then(d=> {
+            vscode.window.showTextDocument(d).then(textEditor=>{
+                goToLine(address.lineNumber)
             })
-            .catch(err => {
-                console.error(err)
+        })
+    } else {
+        vscode.workspace.openTextDocument(filePath).then(d=> {
+            vscode.window.showTextDocument(d).then(textEditor=>{
+                findLineNumber(fs.createReadStream(d.fileName),address.pattern).then(lineNumber => {
+                    console.log("Going to", lineNumber)
+                    goToLine(lineNumber);
+                })
+                .catch(err => {
+                    console.error(err)
+                });
             });
         });
-    });
+    }
 }
 
 function getEditor(): vscode.TextEditor {
